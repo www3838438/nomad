@@ -505,11 +505,12 @@ func (d *DockerDriver) Cleanup(_ *ExecContext, res *CreatedResources) error {
 			for _, value := range resources {
 				if err := d.cleanupImage(value); err != nil {
 					if structs.IsRecoverable(err) {
-						// This will be retried so put it back into the map
-						res.Add(key, value)
 						retry = true
 					}
 					merr.Errors = append(merr.Errors, err)
+
+					// Re-add all failures to the map
+					res.Add(key, value)
 				}
 			}
 		default:
@@ -940,8 +941,6 @@ func (d *DockerDriver) Periodic() (bool, time.Duration) {
 
 // createImage creates a docker image either by pulling it from a registry or by
 // loading it from the file system
-//
-// Returns true if an image was downloaded and should be cleaned up.
 func (d *DockerDriver) createImage(driverConfig *DockerDriverConfig, client *docker.Client, taskDir *allocdir.TaskDir) error {
 	image := driverConfig.ImageName
 	repo, tag := docker.ParseRepositoryTag(image)
