@@ -177,15 +177,12 @@ func (r *AllocRunner) RestoreState() error {
 		tr := NewTaskRunner(r.logger, r.config, r.setTaskState, td, r.Alloc(), task, r.vaultClient)
 		r.tasks[name] = tr
 
-		// Skip tasks in terminal states.
-		if state.State == structs.TaskStateDead {
-			continue
-		}
-
 		if err := tr.RestoreState(); err != nil {
 			r.logger.Printf("[ERR] client: failed to restore state for alloc %s task '%s': %v", r.alloc.ID, name, err)
 			mErr.Errors = append(mErr.Errors, err)
-		} else if !r.alloc.TerminalStatus() {
+			continue
+		}
+		if !r.alloc.TerminalStatus() && state.State != structs.TaskStateDead {
 			// Only start if the alloc isn't in a terminal status.
 			go tr.Run()
 		}
@@ -448,6 +445,7 @@ func (r *AllocRunner) Run() {
 		}
 
 		if r.otherAllocDir != nil {
+			r.logger.Printf("[DEBUG] client: XXX moving %q to %q", r.otherAllocDir.AllocDir, r.allocDir.AllocDir)
 			if err := r.allocDir.Move(r.otherAllocDir, tg.Tasks); err != nil {
 				r.logger.Printf("[ERROR] client: failed to move alloc dir into alloc %q: %v", r.alloc.ID, err)
 			}
