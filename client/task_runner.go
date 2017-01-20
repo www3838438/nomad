@@ -999,6 +999,8 @@ func (r *TaskRunner) run() {
 				<-handleWaitCh
 				r.cleanup()
 
+				time.Sleep(time.Second)
+
 				r.setState(structs.TaskStateDead, nil)
 				return
 			}
