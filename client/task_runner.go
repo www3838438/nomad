@@ -976,6 +976,12 @@ func (r *TaskRunner) run() {
 
 				r.killTask(killEvent)
 				close(stopCollection)
+
+				//BUG(@schmichael) Sleep here triggers a race
+				//on my machine when replacing an alloc w/2
+				//tasks with an alloc w/1 task.
+				time.Sleep(time.Second)
+
 				r.setState(structs.TaskStateDead, nil)
 				return
 			}
