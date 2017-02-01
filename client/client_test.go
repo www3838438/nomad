@@ -74,15 +74,11 @@ func testServer(t *testing.T, cb func(*nomad.Config)) (*nomad.Server, string) {
 		cb(config)
 	}
 
-	shutdownCh := make(chan struct{})
 	logger := log.New(config.LogOutput, "", log.LstdFlags)
-	consulSyncer, err := consul.NewSyncer(config.ConsulConfig, shutdownCh, logger)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
+	catalog := consul.NewMockCatalog(logger)
 
 	// Create server
-	server, err := nomad.NewServer(config, consulSyncer, logger)
+	server, err := nomad.NewServer(config, catalog, logger)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -104,14 +100,11 @@ func testClient(t *testing.T, cb func(c *config.Config)) *Client {
 		cb(conf)
 	}
 
-	shutdownCh := make(chan struct{})
-	consulSyncer, err := consul.NewSyncer(conf.ConsulConfig, shutdownCh, log.New(os.Stderr, "", log.LstdFlags))
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
 	logger := log.New(conf.LogOutput, "", log.LstdFlags)
-	client, err := NewClient(conf, consulSyncer, logger)
+	catalog := consul.NewMockCatalog(logger)
+	mockService := newMockConsulServiceClient()
+	mockService.logger = logger
+	client, err := NewClient(conf, catalog, mockService, logger)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -651,14 +644,11 @@ func TestClient_SaveRestoreState(t *testing.T) {
 	}
 
 	// Create a new client
-	shutdownCh := make(chan struct{})
 	logger := log.New(c1.config.LogOutput, "", log.LstdFlags)
-	consulSyncer, err := consul.NewSyncer(c1.config.ConsulConfig, shutdownCh, logger)
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-
-	c2, err := NewClient(c1.config, consulSyncer, logger)
+	catalog := consul.NewMockCatalog(logger)
+	mockService := newMockConsulServiceClient()
+	mockService.logger = logger
+	c2, err := NewClient(c1.config, catalog, mockService, logger)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
