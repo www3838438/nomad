@@ -1,10 +1,10 @@
-// +build chaos
-
 package consul
 
 import (
 	"fmt"
 	"io/ioutil"
+	mathrand "math/rand"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -16,7 +16,98 @@ import (
 	"github.com/hashicorp/nomad/nomad/structs/config"
 )
 
+func skipChaos(t *testing.T) {
+	if os.Getenv("NOMAD_CHAOS") == "" {
+		t.Skip("Set NOMAD_CHAOS to run slow consul tests")
+	}
+}
+
+// TestSyncerTaskFlapping tests for service registrations flapping in Consul
+// when two tasks are running: one whose name starts with the other's:
+//
+//	foo and foobar
+//
+// See https://github.com/hashicorp/nomad/issues/2294
+func TestSyncerTaskFlapping(t *testing.T) {
+	skipChaos(t)
+
+	// Create an embedded Consul server
+	testconsul := testutil.NewTestServerConfig(t, func(c *testutil.TestServerConfig) {
+		// If -v wasn't specified squelch consul logging
+		if !testing.Verbose() {
+			c.Stdout = ioutil.Discard
+			c.Stderr = ioutil.Discard
+		}
+	})
+	defer testconsul.Stop()
+
+	// Create two Syncers - one for each task
+	cconf := config.DefaultConsulConfig()
+	cconf.Addr = testconsul.HTTPAddr
+
+	t1syncer, err := NewSyncer(cconf, nil, logger)
+	if err != nil {
+		t.Fatalf("Error creating Syncer: %v", err)
+	}
+	defer t1syncer.Shutdown()
+
+	t2syncer, err := NewSyncer(cconf, nil, logger)
+	if err != nil {
+		t.Fatalf("Error creating Syncer: %v", err)
+	}
+	defer t2syncer.Shutdown()
+
+	allocID := "1234" // must share the same alloc ID
+	s1 := &structs.Service{Name: "foo"}
+	s2 := &structs.Service{Name: "foobar"}
+
+	s1domain := NewExecutorDomain(allocID, s1.Name)
+	s2domain := NewExecutorDomain(allocID, s2.Name)
+
+	s1services := map[ServiceKey]*structs.Service{
+		GenerateServiceKey(s1): s1,
+	}
+	s2services := map[ServiceKey]*structs.Service{
+		GenerateServiceKey(s2): s2,
+	}
+
+	// Add the services to the syncers
+	if err := t1syncer.SetServices(s1domain, s1services); err != nil {
+		t.Fatalf("error setting services: %v", err)
+	}
+	if err := t2syncer.SetServices(s2domain, s2services); err != nil {
+		t.Fatalf("error setting services: %v", err)
+	}
+
+	// Run the syncers
+	go t1syncer.Run()
+	defer t1syncer.Shutdown()
+	go t2syncer.Run()
+	defer t2syncer.Shutdown()
+
+	// Give them plenty of time to sync
+	time.Sleep(3 * time.Second)
+
+	// Watch for consistency violations (both services should always exist)
+	dice := mathrand.New(mathrand.NewSource(time.Now().Unix()))
+	deadline := time.Now().Add(30 * time.Second)
+	for i := 0; time.Now().Before(deadline); i++ {
+
+		services, err := t1syncer.client.Agent().Services()
+		if err != nil {
+			t.Fatalf("%d - error querying consul: %v", i, err)
+		}
+		// 2 services + consul itself
+		if expected := 3; len(services) != expected {
+			t.Fatalf("%d - consistency violation; expected %d services but found %d: %#v", i, expected, len(services), services)
+		}
+		time.Sleep(time.Duration(dice.Intn(500)) * time.Millisecond)
+	}
+}
+
 func TestSyncerChaos(t *testing.T) {
+	skipChaos(t)
+
 	// Create an embedded Consul server
 	testconsul := testutil.NewTestServerConfig(t, func(c *testutil.TestServerConfig) {
 		// If -v wasn't specified squelch consul logging
