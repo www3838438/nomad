@@ -18,6 +18,14 @@ import (
 	rootcerts "github.com/hashicorp/go-rootcerts"
 )
 
+// nodeRole differentiates between client and server roles.
+type nodeRole int
+
+const (
+	serverRole nodeRole = 1
+	clientRole nodeRole = 2
+)
+
 // QueryOptions are used to parameterize a query
 type QueryOptions struct {
 	// Providing a datacenter overwrites the region provided
@@ -94,20 +102,24 @@ type Config struct {
 	// Region to use. If not provided, the default agent region is used.
 	Region string
 
-	// HttpClient is the client to use. Default will be
-	// used if not provided.
-	HttpClient *http.Client
+	// ClientHttpClient is the HTTP client to use when communicating with
+	// Nomad client nodes. Default will be used if not provided.
+	ClientHttpClient *http.Client
+
+	// ServerHttpClient is the HTTP client to use when communicating with
+	// Nomad server nodes. Default will be used if not provided.
+	ServerHttpClient *http.Client
 
 	// HttpAuth is the auth info to use for http access.
 	HttpAuth *HttpBasicAuth
 
+	// TLSConfig provides the various TLS related configurations for
+	// the http client.
+	TLSConfig *TLSConfig
+
 	// WaitTime limits how long a Watch will block. If not provided,
 	// the agent default values will be used.
 	WaitTime time.Duration
-
-	// TLSConfig provides the various TLS related configurations for the http
-	// client
-	TLSConfig *TLSConfig
 }
 
 // CopyConfig copies the configuration with a new address
@@ -117,12 +129,13 @@ func (c *Config) CopyConfig(address string, tlsEnabled bool) *Config {
 		scheme = "https"
 	}
 	config := &Config{
-		Address:    fmt.Sprintf("%s://%s", scheme, address),
-		Region:     c.Region,
-		HttpClient: c.HttpClient,
-		HttpAuth:   c.HttpAuth,
-		WaitTime:   c.WaitTime,
-		TLSConfig:  c.TLSConfig,
+		Address:          fmt.Sprintf("%s://%s", scheme, address),
+		Region:           c.Region,
+		ClientHttpClient: c.ClientHttpClient,
+		ServerHttpClient: c.ServerHttpClient,
+		HttpAuth:         c.HttpAuth,
+		WaitTime:         c.WaitTime,
+		TLSConfig:        c.TLSConfig,
 	}
 
 	return config
@@ -156,11 +169,19 @@ type TLSConfig struct {
 // DefaultConfig returns a default configuration for the client
 func DefaultConfig() *Config {
 	config := &Config{
-		Address:    "http://127.0.0.1:4646",
-		HttpClient: cleanhttp.DefaultClient(),
-		TLSConfig:  &TLSConfig{},
+		Address:          "http://127.0.0.1:4646",
+		ClientHttpClient: cleanhttp.DefaultClient(),
+		ServerHttpClient: cleanhttp.DefaultClient(),
+		TLSConfig:        &TLSConfig{},
 	}
-	transport := config.HttpClient.Transport.(*http.Transport)
+
+	transport := config.ClientHttpClient.Transport.(*http.Transport)
+	transport.TLSHandshakeTimeout = 10 * time.Second
+	transport.TLSClientConfig = &tls.Config{
+		MinVersion: tls.VersionTLS12,
+	}
+
+	transport = config.ServerHttpClient.Transport.(*http.Transport)
 	transport.TLSHandshakeTimeout = 10 * time.Second
 	transport.TLSClientConfig = &tls.Config{
 		MinVersion: tls.VersionTLS12,
@@ -209,43 +230,52 @@ func DefaultConfig() *Config {
 
 // ConfigureTLS applies a set of TLS configurations to the the HTTP client.
 func (c *Config) ConfigureTLS() error {
-	if c.HttpClient == nil {
+	if c.ClientHttpClient == nil || c.ServerHttpClient == nil {
 		return fmt.Errorf("config HTTP Client must be set")
 	}
 
-	var clientCert tls.Certificate
-	foundClientCert := false
+	var clientCert *tls.Certificate
 	if c.TLSConfig.ClientCert != "" || c.TLSConfig.ClientKey != "" {
 		if c.TLSConfig.ClientCert != "" && c.TLSConfig.ClientKey != "" {
-			var err error
-			clientCert, err = tls.LoadX509KeyPair(c.TLSConfig.ClientCert, c.TLSConfig.ClientKey)
+			cert, err := tls.LoadX509KeyPair(c.TLSConfig.ClientCert, c.TLSConfig.ClientKey)
 			if err != nil {
 				return err
 			}
-			foundClientCert = true
+			clientCert = &cert
 		} else if c.TLSConfig.ClientCert != "" || c.TLSConfig.ClientKey != "" {
 			return fmt.Errorf("Both client cert and client key must be provided")
 		}
 	}
 
-	clientTLSConfig := c.HttpClient.Transport.(*http.Transport).TLSClientConfig
+	if err := c.configureHttpTLS(c.ClientHttpClient, "client", clientCert); err != nil {
+		return err
+	}
+	if err := c.configureHttpTLS(c.ServerHttpClient, "server", clientCert); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// configureHttpTLS is a helper for configure the tls.Config on http.Clients
+// for a specific role (client or server).
+func (c *Config) configureHttpTLS(client *http.Client, role string, clientCert *tls.Certificate) error {
+	tlsConfig := client.Transport.(*http.Transport).TLSClientConfig
+
 	rootConfig := &rootcerts.Config{
 		CAFile: c.TLSConfig.CACert,
 		CAPath: c.TLSConfig.CAPath,
 	}
-	if err := rootcerts.ConfigureTLS(clientTLSConfig, rootConfig); err != nil {
+	if err := rootcerts.ConfigureTLS(tlsConfig, rootConfig); err != nil {
 		return err
 	}
 
-	clientTLSConfig.InsecureSkipVerify = c.TLSConfig.Insecure
+	tlsConfig.InsecureSkipVerify = c.TLSConfig.Insecure
 
-	if foundClientCert {
-		clientTLSConfig.Certificates = []tls.Certificate{clientCert}
+	if clientCert != nil {
+		tlsConfig.Certificates = []tls.Certificate{*clientCert}
 	}
-	if c.TLSConfig.TLSServerName != "" {
-		clientTLSConfig.ServerName = c.TLSConfig.TLSServerName
-	}
-
+	tlsConfig.ServerName = fmt.Sprintf("%s.%s.nomad", role, c.Region)
 	return nil
 }
 
@@ -265,8 +295,11 @@ func NewClient(config *Config) (*Client, error) {
 		return nil, fmt.Errorf("invalid address '%s': %v", config.Address, err)
 	}
 
-	if config.HttpClient == nil {
-		config.HttpClient = defConfig.HttpClient
+	if config.ClientHttpClient == nil {
+		config.ClientHttpClient = defConfig.ClientHttpClient
+	}
+	if config.ServerHttpClient == nil {
+		config.ServerHttpClient = defConfig.ServerHttpClient
 	}
 
 	// Configure the TLS cofigurations
@@ -426,13 +459,19 @@ func (m *multiCloser) Read(p []byte) (int, error) {
 }
 
 // doRequest runs a request with our client
-func (c *Client) doRequest(r *request) (time.Duration, *http.Response, error) {
+func (c *Client) doRequest(role nodeRole, r *request) (time.Duration, *http.Response, error) {
 	req, err := r.toHTTP()
 	if err != nil {
 		return 0, nil, err
 	}
+
+	client := c.config.ClientHttpClient
+	if role == serverRole {
+		client = c.config.ServerHttpClient
+	}
+
 	start := time.Now()
-	resp, err := c.config.HttpClient.Do(req)
+	resp, err := client.Do(req)
 	diff := time.Now().Sub(start)
 
 	// If the response is compressed, we swap the body's reader.
@@ -462,10 +501,10 @@ func (c *Client) doRequest(r *request) (time.Duration, *http.Response, error) {
 
 // rawQuery makes a GET request to the specified endpoint but returns just the
 // response body.
-func (c *Client) rawQuery(endpoint string, q *QueryOptions) (io.ReadCloser, error) {
+func (c *Client) rawQuery(role nodeRole, endpoint string, q *QueryOptions) (io.ReadCloser, error) {
 	r := c.newRequest("GET", endpoint)
 	r.setQueryOptions(q)
-	_, resp, err := requireOK(c.doRequest(r))
+	_, resp, err := requireOK(c.doRequest(role, r))
 	if err != nil {
 		return nil, err
 	}
@@ -476,10 +515,10 @@ func (c *Client) rawQuery(endpoint string, q *QueryOptions) (io.ReadCloser, erro
 // Query is used to do a GET request against an endpoint
 // and deserialize the response into an interface using
 // standard Nomad conventions.
-func (c *Client) query(endpoint string, out interface{}, q *QueryOptions) (*QueryMeta, error) {
+func (c *Client) query(role nodeRole, endpoint string, out interface{}, q *QueryOptions) (*QueryMeta, error) {
 	r := c.newRequest("GET", endpoint)
 	r.setQueryOptions(q)
-	rtt, resp, err := requireOK(c.doRequest(r))
+	rtt, resp, err := requireOK(c.doRequest(role, r))
 	if err != nil {
 		return nil, err
 	}
