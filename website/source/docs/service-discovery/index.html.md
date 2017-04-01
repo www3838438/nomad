@@ -16,13 +16,15 @@ monitoring.
 
 Note that in order to use Consul with Nomad, you will need to configure and
 install Consul on your nodes alongside Nomad, or schedule it as a system job.
-Nomad does not currently run Consul for you.
+Nomad does not run Consul for you.
 
 ## Configuration
 
-To enable Consul integration, please see the
+By default Nomad will attempt to use a local Consul agent if one is available.
+Most users should not need to manually configure Nomad to use Consul.
+Please see the
 [Nomad agent Consul integration](/docs/agent/configuration/consul.html)
-configuration.
+documentation for configuration options.
 
 
 ## Service Definition Syntax
@@ -37,7 +39,7 @@ To configure a job to register with service discovery, please see the
 - Consul 0.6.0 or later is needed for using the TCP checks.
 
 - The service discovery feature in Nomad depends on operators making sure that
-  the Nomad client can reach the Consul agent.
+  the Nomad client can reach a local Consul agent.
 
 - Tasks running inside Nomad also need to reach out to the Consul agent if
   they want to use any of the Consul APIs. Ex: A task running inside a docker

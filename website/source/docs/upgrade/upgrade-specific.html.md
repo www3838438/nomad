@@ -15,6 +15,14 @@ details provided for their upgrades as a result of new features or changed
 behavior. This page is used to document those details separately from the
 standard upgrade flow.
 
+## Nomad 0.6.0
+
+### Consul Service and Check changes
+
+The code related to registering services and checks with Consul changed
+significantly in Nomad 0.6.0.  Users of script checks are encouraged to test
+their checks against Nomad 0.6.0 before upgrading.
+
 ## Nomad 0.5.5
 
 ### Docker `load` changes

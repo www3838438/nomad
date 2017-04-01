@@ -28,11 +28,15 @@ information about the integration.
 job "docs" {
   group "example" {
     task "server" {
+      # ...driver and configuration omitted...
+
+      # Service stanza for advertising this task via Consul
       service {
         tags = ["leader", "mysql"]
 
         port = "db"
 
+        # Consul will consider this check passing if its able to connect
         check {
           type     = "tcp"
           port     = "db"
@@ -40,6 +44,8 @@ job "docs" {
           timeout  = "2s"
         }
 
+	# Nomad will periodically run this script inside the task's container
+        # and update a health check in Consul
         check {
           type     = "script"
           name     = "check_table"
@@ -66,7 +72,7 @@ does not automatically enable service discovery.
 - `check` <code>([Check](#check-parameters): nil)</code> - Specifies a health
   check associated with the service. This can be specified multiple times to
   define multiple checks for the service. At this time, Nomad supports the
-  `script`<sup><small>1</small></sup>, `http` and `tcp` checks.
+  `script`, `http` and `tcp` checks.
 
 - `name` `(string: "<job>-<group>-<task>")` - Specifies the name of this
   service. If not supplied, this will default to the name of the job, group, and
@@ -101,13 +107,7 @@ does not automatically enable service discovery.
 - `command` `(string: <varies>)` - Specifies the command to run for performing
   the health check. The script must exit: 0 for passing, 1 for warning, or any
   other value for a failing health check. This is required for script-based
-  health checks.
-
-    ~> **Caveat:** The command must be the path to the command on disk, and no
-    shell exists by default. That means operators like `||` or `&&` are not
-    available. Additionally, all arguments must be supplied via the `args`
-    parameter. To achieve the behavior of shell operators, specify the command
-    as a shell, like `/bin/bash` and then use `args` to run the check.
+  health checks. See below for details.
 
 - `initial_status` `(string: <enum>)` - Specifies the originating status of the
   service. Valid options are the empty string, `passing`, `warning`, and
@@ -142,6 +142,35 @@ does not automatically enable service discovery.
 
 - `type` `(string: <required>)` - This indicates the check types supported by
   Nomad. Valid options are `script`, `http`, and `tcp`.
+
+## Script Checks
+
+Script checks are unique: they are registered with Consul with the specified
+`timeout`. Nomad periodically runs the `command` specified in the check and
+updates Consul with the status. If Nomad is unable to run the check before the
+`timeout` expires Consul automatically treats the check as failing.
+
+~> Since script checks are run by the Nomad agent, they will timeout and fail if
+Nomad is down for longer than the timeout. When told to shutdown, Nomad will
+attempt to run and renew all script checks before exiting.
+
+### Script Check Environment
+
+Script checks are executed in the same environment as the task:
+
+* `docker` or `rkt` drivers will use those driver's facilities for executing
+  commands inside containers. 
+* `exec` and `java` drivers will execute commands in the same chroot as the
+  task.
+* `raw_exec` checks are executed on the host system.
+* `qemu` does not support script checks as Nomad has no way of executing
+  arbitrary commands inside a VM.
+
+    ~> **Caveat:** The command must be the path to the command on disk, and no
+    shell exists by default. That means operators like `||` or `&&` are not
+    available. Additionally, all arguments must be supplied via the `args`
+    parameter. To achieve the behavior of shell operators, specify the command
+    as a shell, like `/bin/bash` and then use `args` to run the check.
 
 
 ## `service` Examples
@@ -264,12 +293,6 @@ service {
   }
 }
 ```
-
-- - -
-
-<sup><small>1</small></sup><small> Script checks are not supported for the
-[qemu driver][qemu] since the Nomad client does not have access to the file
-system of a task for that driver.</small>
 
 [service-discovery]: /docs/service-discovery/index.html "Nomad Service Discovery"
 [interpolation]: /docs/runtime/interpolation.html "Nomad Runtime Interpolation"
