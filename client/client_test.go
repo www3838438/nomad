@@ -3,6 +3,7 @@ package client
 import (
 	"archive/tar"
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -766,6 +767,162 @@ func TestClient_SaveRestoreState(t *testing.T) {
 		alive := status == structs.AllocClientStatusRunning || status == structs.AllocClientStatusPending
 		if !alive {
 			return false, fmt.Errorf("incorrect client status: %#v", ar.Alloc())
+		}
+		return true, nil
+	}, func(err error) {
+		t.Fatalf("err: %v", err)
+	})
+
+	// Destroy all the allocations
+	for _, ar := range c2.getAllocRunners() {
+		ar.Destroy()
+	}
+
+	for _, ar := range c2.getAllocRunners() {
+		<-ar.WaitCh()
+	}
+}
+
+// TestClient_SaveRestoreState_Corrupt asserts allocations with corrupt state
+// files are marked as failed and do not prevent client startup.
+func TestClient_SaveRestoreState_Corrupt(t *testing.T) {
+	ctestutil.ExecCompatible(t)
+	s1, _ := testServer(t, nil)
+	defer s1.Shutdown()
+	testutil.WaitForLeader(t, s1.RPC)
+
+	c1 := testClient(t, func(c *config.Config) {
+		c.DevMode = false
+		c.RPCHandler = s1
+	})
+	defer c1.Shutdown()
+
+	// Wait til the node is ready
+	waitTilNodeReady(c1, t)
+
+	// Create mock allocations
+	job := mock.Job()
+	job.Name = "corrupt"
+	alloc1 := mock.Alloc()
+	alloc1.NodeID = c1.Node().ID
+	alloc1.Job = job
+	alloc1.JobID = job.ID
+	alloc1.Job.TaskGroups[0].Tasks[0].Driver = "mock_driver"
+	task := alloc1.Job.TaskGroups[0].Tasks[0]
+	task.Config["run_for"] = "10s"
+
+	state := s1.State()
+	if err := state.UpsertJob(100, job); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.UpsertJobSummary(101, mock.JobSummary(alloc1.JobID)); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.UpsertAllocs(102, []*structs.Allocation{alloc1}); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	job2 := mock.Job()
+	job2.Name = "safe"
+	alloc2 := mock.Alloc()
+	alloc2.NodeID = c1.Node().ID
+	alloc2.Job = job2
+	alloc2.JobID = job2.ID
+	alloc2.Job.TaskGroups[0].Tasks[0].Driver = "mock_driver"
+	task2 := alloc1.Job.TaskGroups[0].Tasks[0]
+	task2.Config["run_for"] = "10s"
+
+	if err := state.UpsertJob(100, job2); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.UpsertJobSummary(101, mock.JobSummary(alloc2.JobID)); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.UpsertAllocs(102, []*structs.Allocation{alloc2}); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Store the path to alloc1's task's state file
+	alloc1TaskFile := ""
+
+	// Allocations should get registered
+	testutil.WaitForResult(func() (bool, error) {
+		c1.allocLock.RLock()
+		ar1 := c1.allocs[alloc1.ID]
+		ar2 := c1.allocs[alloc2.ID]
+		c1.allocLock.RUnlock()
+		if ar1 == nil || ar2 == nil {
+			return false, fmt.Errorf("nil alloc runner")
+		}
+		if ar1.Alloc().ClientStatus != structs.AllocClientStatusRunning {
+			return false, fmt.Errorf("ar1: client status: got %v; want %v", ar1.Alloc().ClientStatus, structs.AllocClientStatusRunning)
+		}
+		if ar2.Alloc().ClientStatus != structs.AllocClientStatusRunning {
+			return false, fmt.Errorf("ar2: client status: got %v; want %v", ar2.Alloc().ClientStatus, structs.AllocClientStatusRunning)
+		}
+		trs := ar1.getTaskRunners()
+		if len(trs) != 1 {
+			return false, fmt.Errorf("ar1: expected 1 task runner found %d", len(trs))
+		}
+		alloc1TaskFile = trs[0].stateFilePath()
+		return true, nil
+	}, func(err error) {
+		t.Fatalf("err: %v", err)
+	})
+
+	// Shutdown the client, saves state
+	if err := c1.Shutdown(); err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	// Corrupt the state of alloc1
+	var stateMap map[string]interface{}
+	if f, err := os.Open(alloc1TaskFile); err != nil {
+		t.Fatalf("error opening state file %q: %v", alloc1TaskFile, err)
+	} else {
+		if err := json.NewDecoder(f).Decode(&stateMap); err != nil {
+			f.Close()
+			t.Fatalf("error unmarshalling valid state file: %v", err)
+		}
+		f.Close()
+	}
+	if _, ok := stateMap["Task"]; !ok {
+		t.Fatalf("expected Task key to exist")
+	}
+	delete(stateMap, "Task")
+	if out, err := json.Marshal(stateMap); err != nil {
+		t.Fatalf("error marshalling corrupt state file: %v", err)
+	} else {
+		if err := ioutil.WriteFile(alloc1TaskFile, out, 0644); err != nil {
+			t.Fatalf("error writing corrupt state file %q: %v", alloc1TaskFile, err)
+		}
+	}
+
+	// Create a new client
+	logger := log.New(c1.config.LogOutput, "", log.LstdFlags)
+	catalog := consul.NewMockCatalog(logger)
+	mockService := newMockConsulServiceClient()
+	mockService.logger = logger
+	c2, err := NewClient(c1.config, catalog, mockService, logger)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	defer c2.Shutdown()
+
+	// Assert the corrupt alloc fails and the ok allocs starts
+	testutil.WaitForResult(func() (bool, error) {
+		c1.allocLock.RLock()
+		ar1 := c1.allocs[alloc1.ID]
+		ar2 := c1.allocs[alloc2.ID]
+		c1.allocLock.RUnlock()
+		if ar1 == nil || ar2 == nil {
+			return false, fmt.Errorf("nil alloc runner")
+		}
+		if ar1.Alloc().ClientStatus != structs.AllocClientStatusFailed {
+			return false, fmt.Errorf("ar1: client status: got %v; want %v", ar1.Alloc().ClientStatus, structs.AllocClientStatusFailed)
+		}
+		if ar2.Alloc().ClientStatus != structs.AllocClientStatusRunning {
+			return false, fmt.Errorf("ar2: client status: got %v; want %v", ar2.Alloc().ClientStatus, structs.AllocClientStatusRunning)
 		}
 		return true, nil
 	}, func(err error) {
