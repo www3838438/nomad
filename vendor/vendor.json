@@ -43,10 +43,10 @@
 			"revisionTime": "2012-06-04T00:48:16Z"
 		},
 		{
-			"checksumSHA1": "OTN4c1F0p+mEG2CpkU1Kuavupf0=",
+			"checksumSHA1": "qO2mrhn8i9R7wApnfPwxSAA1TeE=",
 			"path": "github.com/RackSec/srslog",
-			"revision": "259aed10dfa74ea2961eddd1d9847619f6e98837",
-			"revisionTime": "2016-01-20T22:33:50Z"
+			"revision": "a974ba6f7fb527d2ddc73ee9c05d3e2ccc0af0dc",
+			"revisionTime": "2017-01-06T17:10:28Z"
 		},
 		{
 			"comment": "v0.8.7-87-g4b6ea73",
