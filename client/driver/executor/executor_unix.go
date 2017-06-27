@@ -38,7 +38,7 @@ func (e *UniversalExecutor) collectLogs(we io.Writer, wo io.Writer) {
 	for logParts := range e.syslogChan {
 		// If the severity of the log line is err then we write to stderr
 		// otherwise all messages go to stdout
-		if logParts.Severity == syslog.LOG_ERR {
+		if logParts.Severity&syslog.LOG_ERR == 1 {
 			e.lre.Write(logParts.Message)
 			e.lre.Write([]byte{'\n'})
 		} else {

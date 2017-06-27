@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"strconv"
+	"time"
 
 	syslog "github.com/RackSec/srslog"
 )
@@ -24,6 +25,15 @@ var (
 const (
 	PRI_PART_START = '<'
 	PRI_PART_END   = '>'
+
+	// sevMask is the mask to get a severity from a priority
+	sevMask = 0x07
+
+	// facMask is the mask to get a facility from a priority
+	facMask = 0xF8
+
+	// parseErrRate limits how often log parse errors are logged
+	parseErrRate = time.Minute
 )
 
 // SyslogMessage represents a log line received
@@ -42,6 +52,10 @@ type Priority struct {
 // DockerLogParser parses a line of log message that the docker daemon ships
 type DockerLogParser struct {
 	logger *log.Logger
+
+	// squelchUntil prevents logging parsing errors until a time limit is
+	// reached to limit error logging when syslog is buggy.
+	squelchUntil time.Time
 }
 
 // NewDockerLogParser creates a new DockerLogParser
@@ -51,7 +65,12 @@ func NewDockerLogParser(logger *log.Logger) *DockerLogParser {
 
 // Parse parses a syslog log line
 func (d *DockerLogParser) Parse(line []byte) *SyslogMessage {
-	pri, _, _ := d.parsePriority(line)
+	pri, n, err := d.parsePriority(line)
+	if err != nil && time.Now().After(d.squelchUntil) {
+		d.logger.Printf("[ERR] executor: error parsing syslog line: %v Raw line: %q", err, line)
+		d.squelchUntil = time.Now().Add(parseErrRate)
+	}
+	d.logger.Printf("[DEBUG] executor: line: (%v:%d) %v Raw line: %q", pri, n, err, line)
 	msgIdx := d.logContentIndex(line)
 
 	// Create a copy of the line so that subsequent Scans do not override the
@@ -107,16 +126,15 @@ func (d *DockerLogParser) logContentIndex(line []byte) int {
 // parsePriority parses the priority in a syslog message
 func (d *DockerLogParser) parsePriority(line []byte) (Priority, int, error) {
 	cursor := 0
-	pri := d.newPriority(0)
-	if len(line) <= 0 {
+	pri := newPriority(0)
+	if len(line) == 0 {
 		return pri, cursor, ErrPriorityEmpty
 	}
 	if line[cursor] != PRI_PART_START {
 		return pri, cursor, ErrPriorityNoStart
 	}
-	i := 1
 	priDigit := 0
-	for i < len(line) {
+	for i := 1; i < len(line); i++ {
 		if i >= 5 {
 			return pri, cursor, ErrPriorityTooLong
 		}
@@ -126,9 +144,9 @@ func (d *DockerLogParser) parsePriority(line []byte) (Priority, int, error) {
 				return pri, cursor, ErrPriorityTooShort
 			}
 			cursor = i + 1
-			return d.newPriority(priDigit), cursor, nil
+			return newPriority(priDigit), cursor, nil
 		}
-		if d.isDigit(c) {
+		if isDigit(c) {
 			v, e := strconv.Atoi(string(c))
 			if e != nil {
 				return pri, cursor, e
@@ -137,23 +155,22 @@ func (d *DockerLogParser) parsePriority(line []byte) (Priority, int, error) {
 		} else {
 			return pri, cursor, ErrPriorityNonDigit
 		}
-		i++
 	}
 	return pri, cursor, ErrPriorityNoEnd
 }
 
 // isDigit checks if a byte is a numeric char
-func (d *DockerLogParser) isDigit(c byte) bool {
+func isDigit(c byte) bool {
 	return c >= '0' && c <= '9'
 }
 
 // newPriority creates a new default priority
-func (d *DockerLogParser) newPriority(p int) Priority {
+func newPriority(p int) Priority {
 	// The Priority value is calculated by first multiplying the Facility
 	// number by 8 and then adding the numerical value of the Severity.
 	return Priority{
 		Pri:      p,
-		Facility: syslog.Priority(p / 8),
-		Severity: syslog.Priority(p % 8),
+		Facility: syslog.Priority(p & facMask),
+		Severity: syslog.Priority(p & sevMask),
 	}
 }
