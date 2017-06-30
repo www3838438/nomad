@@ -644,7 +644,6 @@ func (c *Client) restoreState() error {
 	}
 
 	// Load each alloc back
-	var mErr multierror.Error
 	for _, id := range allocs {
 		alloc := &structs.Allocation{ID: id}
 
@@ -652,32 +651,35 @@ func (c *Client) restoreState() error {
 		ar := NewAllocRunner(c.logger, c.configCopy, c.stateDB, c.updateAllocStatus, alloc, c.vaultClient, c.consulService)
 		c.configLock.RUnlock()
 
+		// Track before restoring so that even if the restore fails we update the servers with the failed state in
 		c.allocLock.Lock()
 		c.allocs[id] = ar
 		c.allocLock.Unlock()
 
 		if err := ar.RestoreState(); err != nil {
 			c.logger.Printf("[ERR] client: failed to restore state for alloc %s: %v", id, err)
-			mErr.Errors = append(mErr.Errors, err)
-		} else {
-			go ar.Run()
+			r.failAlloc(id, ar.taskStates, err.Error())
+			continue
+		}
 
-			if upgrading {
-				if err := ar.SaveState(); err != nil {
-					c.logger.Printf("[WARN] client: initial save state for alloc %s failed: %v", id, err)
-				}
+		// Alloc restored: run
+		go ar.Run()
+
+		if upgrading {
+			if err := ar.SaveState(); err != nil {
+				c.logger.Printf("[ERR] client: initial save state for alloc %s failed: %v", id, err)
 			}
 		}
 	}
 
-	// Delete all the entries
+	// Delete the pre-0.6 alloc directories
 	if upgrading {
 		if err := os.RemoveAll(allocDir); err != nil {
-			mErr.Errors = append(mErr.Errors, err)
+			return fmt.Errorf("error deleting pre-0.6 alloc state dir: %v", err)
 		}
 	}
 
-	return mErr.ErrorOrNil()
+	return nil
 }
 
 // saveState is used to snapshot our state into the data dir.
@@ -1238,6 +1240,32 @@ func (c *Client) updateNodeStatus() error {
 	}
 
 	return nil
+}
+
+// failAlloc marks an alloc and all of its tasks as failed
+func (c *Client) failAlloc(id string, taskStates map[string]*structs.TaskState, reason string) {
+	// Make sure all task states are failed
+	for name, ts := range taskStates {
+		if ts == nil {
+			// This shouldn't be possible but be extra defensive as
+			// we only reach this point when things are bad.
+			ts = &structs.TaskState{}
+			taskStates[name] = ts
+		}
+		ts.State = structs.TaskStateDead
+		ts.Failed = true
+		if !ts.StartedAt.IsZero() && ts.FinishedAt.IsZero() {
+			ts.FinishedAt = time.Now()
+		}
+	}
+	alloc := &structs.Allocation{
+		ID:                      id,
+		NodeID:                  c.Node().ID,
+		TaskStates:              taskStates,
+		ClientStatus:            structs.AllocClientStatusFailed,
+		ClientStatusDescription: reason,
+	}
+	c.updateAllocStatus(alloc)
 }
 
 // updateAllocStatus is used to update the status of an allocation

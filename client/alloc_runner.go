@@ -161,6 +161,8 @@ func (r *AllocRunner) pre060StateFilePath() string {
 }
 
 // RestoreState is used to restore the state of the alloc runner
+//
+// No TaskRunners are Run if an error is returned.
 func (r *AllocRunner) RestoreState() error {
 
 	// COMPAT: Remove in 0.7.0
@@ -265,7 +267,8 @@ func (r *AllocRunner) RestoreState() error {
 			err := fmt.Errorf("failed to find task dir metadata for alloc %q task %q",
 				r.alloc.ID, name)
 			r.logger.Printf("[ERR] client: %v", err)
-			return err
+			mErr.Errors = append(mErr.Errors, err)
+			continue
 		}
 
 		tr := NewTaskRunner(r.logger, r.config, r.stateDB, r.setTaskState, td, r.Alloc(), task, r.vaultClient, r.consulClient)
@@ -279,25 +282,37 @@ func (r *AllocRunner) RestoreState() error {
 		if restartReason, err := tr.RestoreState(); err != nil {
 			r.logger.Printf("[ERR] client: failed to restore state for alloc %s task %q: %v", r.alloc.ID, name, err)
 			mErr.Errors = append(mErr.Errors, err)
-		} else if !r.alloc.TerminalStatus() {
-			// Only start if the alloc isn't in a terminal status.
-			go tr.Run()
-
-			if upgrading {
-				if err := tr.SaveState(); err != nil {
-					r.logger.Printf("[WARN] client: initial save state for alloc %s task %s failed: %v", r.alloc.ID, name, err)
-				}
-			}
-
-			// Restart task runner if RestoreState gave a reason
-			if restartReason != "" {
-				r.logger.Printf("[INFO] client: restarting alloc %s task %s: %v", r.alloc.ID, name, restartReason)
-				tr.Restart("upgrade", restartReason)
-			}
 		}
 	}
 
-	return mErr.ErrorOrNil()
+	// If we encountered errors return them before starting tasks
+	if err := mErr.ErrorOrNil(); err != nil {
+		return err
+	}
+
+	// Don't start tasks if alloc is terminal
+	if r.alloc.TerminalStatus() {
+		return nil
+	}
+
+	// Start task runners
+	for name, tr := range r.tasks {
+		go tr.Run()
+
+		if upgrading {
+			if err := tr.SaveState(); err != nil {
+				r.logger.Printf("[ERR] client: initial save state for alloc %s task %s failed: %v", r.alloc.ID, name, err)
+			}
+		}
+
+		// Restart task runner if RestoreState gave a reason
+		if restartReason != "" {
+			r.logger.Printf("[INFO] client: restarting alloc %s task %s: %v", r.alloc.ID, name, restartReason)
+			tr.Restart("upgrade", restartReason)
+		}
+	}
+
+	return nil
 }
 
 // SaveState is used to snapshot the state of the alloc runner
