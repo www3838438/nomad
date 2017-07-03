@@ -253,6 +253,9 @@ func (r *AllocRunner) RestoreState() error {
 		return fmt.Errorf("restored allocation doesn't contain task group %q", r.alloc.TaskGroup)
 	}
 
+	// map of task names to restart reasons since restarting is done after all tasks are restored
+	restarts := make(map[string]string, len(tg.Tasks))
+
 	// Restore the task runners
 	var mErr multierror.Error
 	for _, task := range tg.Tasks {
@@ -279,9 +282,15 @@ func (r *AllocRunner) RestoreState() error {
 			continue
 		}
 
-		if restartReason, err := tr.RestoreState(); err != nil {
+		restartReason, err := tr.RestoreState()
+		if err != nil {
 			r.logger.Printf("[ERR] client: failed to restore state for alloc %s task %q: %v", r.alloc.ID, name, err)
 			mErr.Errors = append(mErr.Errors, err)
+		}
+
+		if restartReason != "" {
+			// Mark task for restarting after all restores complete
+			restarts[name] = restartReason
 		}
 	}
 
@@ -306,9 +315,9 @@ func (r *AllocRunner) RestoreState() error {
 		}
 
 		// Restart task runner if RestoreState gave a reason
-		if restartReason != "" {
-			r.logger.Printf("[INFO] client: restarting alloc %s task %s: %v", r.alloc.ID, name, restartReason)
-			tr.Restart("upgrade", restartReason)
+		if reason := restarts[name]; reason != "" {
+			r.logger.Printf("[INFO] client: restarting alloc %s task %s: %v", r.alloc.ID, name, reason)
+			tr.Restart("upgrade", reason)
 		}
 	}
 
@@ -419,6 +428,11 @@ func (r *AllocRunner) DestroyState() error {
 
 // DestroyContext is used to destroy the context
 func (r *AllocRunner) DestroyContext() error {
+	if r.allocDir == nil {
+		// Be defensive in case this is called on an AllocRunner in a
+		// bad state during a failed restore.
+		return fmt.Errorf("uninitialized alloc dir")
+	}
 	return r.allocDir.Destroy()
 }
 

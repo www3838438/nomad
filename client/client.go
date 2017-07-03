@@ -298,9 +298,15 @@ func NewClient(cfg *config.Config, consulCatalog consul.CatalogAPI, consulServic
 	}
 
 	// Restore the state
-	if err := c.restoreState(); err != nil {
+	failedAllocs, err := c.restoreState()
+	if err != nil {
 		return nil, fmt.Errorf("failed to restore state: %v", err)
 	}
+
+	// Update server with allocs that failed to restore once everything is
+	// started to avoid deadlocks on chans like allocUpdates
+	c.updateFailedAllocs(failedAllocs)
+	c.logger.Printf("[DEBUG] client: XXXXXxxxxxxxx FIXME sent failed allocs")
 
 	// Register and then start heartbeating to the servers.
 	go c.registerAndHeartbeat()
@@ -600,10 +606,11 @@ func (c *Client) SetServers(servers []string) error {
 	return nil
 }
 
-// restoreState is used to restore our state from the data dir
-func (c *Client) restoreState() error {
+// restoreState is used to restore our state from the data dir. Returns allocs
+// that could not be restored or an error for fatal errors.
+func (c *Client) restoreState() ([]*structs.Allocation, error) {
 	if c.config.DevMode {
-		return nil
+		return nil, nil
 	}
 
 	// COMPAT: Remove in 0.7.0
@@ -623,7 +630,7 @@ func (c *Client) restoreState() error {
 	allocDir := filepath.Join(c.config.StateDir, "alloc")
 	list, err := ioutil.ReadDir(allocDir)
 	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("failed to list alloc state: %v", err)
+		return nil, fmt.Errorf("failed to list alloc state: %v", err)
 	} else if err == nil && len(list) != 0 {
 		upgrading = true
 		for _, entry := range list {
@@ -639,11 +646,12 @@ func (c *Client) restoreState() error {
 			return nil
 		})
 		if err != nil {
-			return err
+			return nil, err
 		}
 	}
 
 	// Load each alloc back
+	var failedAllocs []*structs.Allocation
 	for _, id := range allocs {
 		alloc := &structs.Allocation{ID: id}
 
@@ -651,16 +659,23 @@ func (c *Client) restoreState() error {
 		ar := NewAllocRunner(c.logger, c.configCopy, c.stateDB, c.updateAllocStatus, alloc, c.vaultClient, c.consulService)
 		c.configLock.RUnlock()
 
-		// Track before restoring so that even if the restore fails we update the servers with the failed state in
+		if err := ar.RestoreState(); err != nil {
+			c.logger.Printf("[ERR] client: failed to restore state for alloc %s: %v", id, err)
+
+			// Cleanup allocdir
+			ar.DestroyContext()
+
+			// Don't try to restore again
+			ar.DestroyState()
+
+			// Add to batch to be sent to the server
+			failedAllocs = append(failedAllocs, c.failAlloc(id, ar.taskStates, err.Error()))
+			continue
+		}
+
 		c.allocLock.Lock()
 		c.allocs[id] = ar
 		c.allocLock.Unlock()
-
-		if err := ar.RestoreState(); err != nil {
-			c.logger.Printf("[ERR] client: failed to restore state for alloc %s: %v", id, err)
-			r.failAlloc(id, ar.taskStates, err.Error())
-			continue
-		}
 
 		// Alloc restored: run
 		go ar.Run()
@@ -675,11 +690,11 @@ func (c *Client) restoreState() error {
 	// Delete the pre-0.6 alloc directories
 	if upgrading {
 		if err := os.RemoveAll(allocDir); err != nil {
-			return fmt.Errorf("error deleting pre-0.6 alloc state dir: %v", err)
+			return nil, fmt.Errorf("error deleting pre-0.6 alloc state dir: %v", err)
 		}
 	}
 
-	return nil
+	return failedAllocs, nil
 }
 
 // saveState is used to snapshot our state into the data dir.
@@ -1093,12 +1108,12 @@ func (c *Client) periodicSnapshot() {
 // run is a long lived goroutine used to run the client
 func (c *Client) run() {
 	// Watch for changes in allocations
-	allocUpdates := make(chan *allocUpdates, 8)
-	go c.watchAllocations(allocUpdates)
+	updates := make(chan *allocUpdates, 8)
+	go c.watchAllocations(updates)
 
 	for {
 		select {
-		case update := <-allocUpdates:
+		case update := <-updates:
 			c.runAllocs(update)
 
 		case <-c.shutdownCh:
@@ -1242,8 +1257,9 @@ func (c *Client) updateNodeStatus() error {
 	return nil
 }
 
-// failAlloc marks an alloc and all of its tasks as failed
-func (c *Client) failAlloc(id string, taskStates map[string]*structs.TaskState, reason string) {
+// failAlloc creates a new failed alloc from an ID and optionally tasks. Used
+// in cases where the alloc runner is in a bad state (eg could not be restored)
+func (c *Client) failAlloc(id string, taskStates map[string]*structs.TaskState, reason string) *structs.Allocation {
 	// Make sure all task states are failed
 	for name, ts := range taskStates {
 		if ts == nil {
@@ -1258,14 +1274,39 @@ func (c *Client) failAlloc(id string, taskStates map[string]*structs.TaskState, 
 			ts.FinishedAt = time.Now()
 		}
 	}
-	alloc := &structs.Allocation{
-		ID:                      id,
-		NodeID:                  c.Node().ID,
-		TaskStates:              taskStates,
-		ClientStatus:            structs.AllocClientStatusFailed,
-		ClientStatusDescription: reason,
+	return &structs.Allocation{
+		ID:                id,
+		NodeID:            c.Node().ID,
+		TaskStates:        taskStates,
+		ClientStatus:      structs.AllocClientStatusFailed,
+		ClientDescription: reason,
 	}
-	c.updateAllocStatus(alloc)
+}
+
+// updateFailedAllocs is like updateAllocStatus but for allocations which are
+// in a bad state and shouldn't have their alloc dirs migrated (eg they failed
+// to restore).
+func (c *Client) updateFailedAllocs(failedAllocs []*structs.Allocation) {
+	for _, alloc := range failedAllocs {
+		// Check for allocs being blocked by this one and unblock them without
+		// attempting to migrate data as we can't trust its state
+		c.blockedAllocsLock.Lock()
+		blockedAlloc, ok := c.blockedAllocations[alloc.ID]
+		if ok {
+			delete(c.blockedAllocations, blockedAlloc.PreviousAllocation)
+			c.blockedAllocsLock.Unlock()
+
+			if err := c.addAlloc(blockedAlloc, nil); err != nil {
+				c.logger.Printf("[ERR] client: failed to add alloc which was previously blocked %q: %v", blockedAlloc.ID, err)
+			}
+		} else {
+			c.blockedAllocsLock.Unlock()
+		}
+	}
+
+	if err := c.sendAllocSync(failedAllocs); err != nil {
+		c.logger.Printf("[ERR] client: failed sending failed allocs to server: %v", err)
+	}
 }
 
 // updateAllocStatus is used to update the status of an allocation
@@ -1344,14 +1385,7 @@ func (c *Client) allocSync() {
 				sync = append(sync, alloc)
 			}
 
-			// Send to server.
-			args := structs.AllocUpdateRequest{
-				Alloc:        sync,
-				WriteRequest: structs.WriteRequest{Region: c.Region()},
-			}
-
-			var resp structs.GenericResponse
-			if err := c.RPC("Node.UpdateAlloc", &args, &resp); err != nil {
+			if err := c.sendAllocSync(sync); err != nil {
 				c.logger.Printf("[ERR] client: failed to update allocations: %v", err)
 				syncTicker.Stop()
 				syncTicker = time.NewTicker(c.retryIntv(allocSyncRetryIntv))
@@ -1366,6 +1400,18 @@ func (c *Client) allocSync() {
 			}
 		}
 	}
+}
+
+// sendAllocSync sends a batch of allocation updates to the server
+func (c *Client) sendAllocSync(allocs []*structs.Allocation) error {
+	// Send to server.
+	args := structs.AllocUpdateRequest{
+		Alloc:        allocs,
+		WriteRequest: structs.WriteRequest{Region: c.Region()},
+	}
+
+	var resp structs.GenericResponse
+	return c.RPC("Node.UpdateAlloc", &args, &resp)
 }
 
 // allocUpdates holds the results of receiving updated allocations from the
