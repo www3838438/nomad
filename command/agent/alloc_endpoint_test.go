@@ -295,3 +295,22 @@ func TestHTTP_AllocAllGC(t *testing.T) {
 	})
 
 }
+
+func TestHTTP_AllocAllGC_ACL(t *testing.T) {
+	//t.Parallel()
+	httpACLTest(t, nil, func(s *TestAgent) {
+		// Make the HTTP request
+		req, err := http.NewRequest("GET", "/v1/client/gc", nil)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		respW := httptest.NewRecorder()
+
+		// Make the request
+		_, err = s.Server.ClientGCRequest(respW, req)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+	})
+
+}
