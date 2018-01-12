@@ -1468,6 +1468,7 @@ func TestGetAddress(t *testing.T) {
 		Port        int
 		ErrContains string
 	}{
+		// Valid Configurations
 		{
 			Name:      "ExampleService",
 			Mode:      structs.AddressModeAuto,
@@ -1529,6 +1530,8 @@ func TestGetAddress(t *testing.T) {
 			IP:   "10.1.2.3",
 			Port: 7890,
 		},
+
+		// Invalid Configurations
 		{
 			Name:        "DriverWithoutNetwork",
 			Mode:        structs.AddressModeDriver,
